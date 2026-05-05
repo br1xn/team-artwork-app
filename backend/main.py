@@ -21,6 +21,7 @@ from services.generator import ArtworkGeneratorService
 from services.image_processor import ImageProcessor
 from services.logo_validator import LogoValidator
 from services.scraper import PlayerScraper
+from services.team_identifier import TeamIdentifier  # <-- New Import
 from utils.color_utils import infer_palette_from_name
 
 limiter = Limiter(key_func=get_remote_address)
@@ -28,8 +29,8 @@ limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
     title="Team Artwork API",
-    version="1.0.0",
-    description="Validate team assets, scrape player data, and generate fallback artwork.",
+    version="1.1.0",
+    description="Validate team assets, scrape player data, auto-identify logos, and generate artwork.",
 )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -54,6 +55,7 @@ validator = LogoValidator(timeout=10)
 scraper = PlayerScraper(timeout=10)
 processor = ImageProcessor(static_root=static_root, timeout=10)
 generator = ArtworkGeneratorService(static_root=static_root)
+identifier = TeamIdentifier(timeout=15)  # <-- Instantiate the new service
 
 
 @app.get("/health")
@@ -70,15 +72,29 @@ def process_team_preview() -> RedirectResponse:
 @limiter.limit("15/minute")
 async def process_team(
     request: Request,
-    team_name: str = Form(...),
+    team_name: str | None = Form(default=None), # <-- Make this optional
     logo: UploadFile | None = File(default=None),
 ) -> ProcessTeamResponse:
-    team = team_name.strip()
-    if not team:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Team name is required.")
+    
+    # 1. Catch if the user sent absolutely nothing
+    if not team_name and not logo:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="You must provide either a team name or upload a logo.")
 
     try:
         logo_bytes = await logo.read() if logo else None
+
+        # 2. AI Team Identification (The New Magic)
+        if not team_name:
+            # We run the REST call in a threadpool so it doesn't block the async server
+            inferred_name = await run_in_threadpool(identifier.identify, logo_bytes)
+            if not inferred_name:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST, 
+                    detail="Could not automatically identify the team from this logo. Please enter the team name manually."
+                )
+            team_name = inferred_name
+
+        team = team_name.strip()
         logo_path = _save_uploaded_logo(team, logo_bytes) if logo_bytes else None
 
         async def run_validation():
@@ -129,6 +145,9 @@ async def process_team(
         )
 
         return ProcessTeamResponse(validation=validation, players=players, artwork=artwork)
+        
+    except HTTPException:
+        raise # Allow our explicit HTTP exceptions to pass through
     except asyncio.TimeoutError as exc:
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,

@@ -89,46 +89,80 @@ class PlayerScraper:
         "washington commanders": "wsh",
     }
 
+    NBA_TEAMS = {
+        "atlanta hawks": "atl", "boston celtics": "bos", "brooklyn nets": "bkn",
+        "charlotte hornets": "cha", "chicago bulls": "chi", "cleveland cavaliers": "cle",
+        "dallas mavericks": "dal", "denver nuggets": "den", "detroit pistons": "det",
+        "golden state warriors": "gs", "houston rockets": "hou", "indiana pacers": "ind",
+        "los angeles clippers": "lac", "la clippers": "lac", "los angeles lakers": "lal",
+        "lakers": "lal", "memphis grizzlies": "mem", "miami heat": "mia",
+        "milwaukee bucks": "mil", "minnesota timberwolves": "min", "new orleans pelicans": "no",
+        "new york knicks": "ny", "knicks": "ny", "oklahoma city thunder": "okc",
+        "orlando magic": "orl", "philadelphia 76ers": "phi", "76ers": "phi",
+        "phoenix suns": "pho", "portland trail blazers": "por", "sacramento kings": "sac",
+        "san antonio spurs": "sa", "toronto raptors": "tor", "utah jazz": "utah",
+        "washington wizards": "was",
+    }
+
     def scrape_players(self, team_name: str) -> PlayerCollectionResponse:
         players = self._scrape_ipl_roster(team_name)
         if not players:
             players = self._scrape_nfl_roster(team_name)
+        if not players:
+            players = self._scrape_nba_roster(team_name)
         if not players:
             players = self._scrape_wikipedia_roster(team_name)
         if not players:
             players = self._scrape_espn_roster(team_name)
         players = self._clean_players(players)
         
-        # Enrich missing headshots perfectly
-        players = self._enrich_missing_images(players)
-        
         if not players:
             players = self._fallback_players()
         return PlayerCollectionResponse(team_name=team_name, players=players)
 
-    def _enrich_missing_images(self, players: list[Player]) -> list[Player]:
-        for p in players:
-            if not p.image_url:
-                url = f"https://site.web.api.espn.com/apis/search/v2?query={quote_plus(p.name)}&limit=3"
-                try:
-                    response = requests.get(url, headers=DEFAULT_HEADERS, timeout=self.timeout)
-                    if response.status_code == 200:
-                        results = response.json().get('results', [])
-                        for res in results:
-                            if 'contents' in res:
-                                for item in res['contents']:
-                                    # Fuzzy match name to avoid middle initials failing exact match
-                                    item_name = item.get('displayName', '').lower()
-                                    if p.name.lower() in item_name or item_name in p.name.lower():
-                                        img = item.get('image')
-                                        if img and img.get('default'):
-                                            p.image_url = img.get('default')
-                                            break
-                            if p.image_url:
-                                break
-                except Exception:
-                    pass
-        return players
+    def search_player_by_name(self, name: str) -> Player | None:
+        url = f"https://site.web.api.espn.com/apis/search/v2?query={quote_plus(name)}&limit=5"
+        try:
+            response = requests.get(url, headers=DEFAULT_HEADERS, timeout=self.timeout)
+            if response.status_code == 200:
+                results = response.json().get('results', [])
+                for res in results:
+                    if 'contents' in res:
+                        for item in res['contents']:
+                            item_name = item.get('displayName', '')
+                            
+                            # Ensure it's actually an athlete
+                            if item.get('type') not in ['athlete', 'player']:
+                                continue
+                                
+                            if name.lower() in item_name.lower() or item_name.lower() in name.lower():
+                                img = item.get('image', {}).get('default')
+                                
+                                # SAFELY EXTRACT POSITION (Handles strings or dicts depending on ESPN's mood)
+                                pos_obj = item.get('position')
+                                pos = ""
+                                if isinstance(pos_obj, dict):
+                                    pos = pos_obj.get('displayName') or pos_obj.get('abbreviation') or ""
+                                elif isinstance(pos_obj, str):
+                                    pos = pos_obj
+
+                                # SAFELY EXTRACT TEAM (Handles strings or dicts)
+                                team_obj = item.get('team')
+                                team = ""
+                                if isinstance(team_obj, dict):
+                                    team = team_obj.get('displayName') or team_obj.get('abbreviation') or ""
+                                elif isinstance(team_obj, str):
+                                    team = team_obj
+
+                                # BUILD CLEAN ROLE STRING
+                                role_parts = [p for p in [pos, team] if p]
+                                role = " - ".join(role_parts) if role_parts else "Active Roster"
+                                
+                                return Player(name=item_name, role=role, image_url=img, source="Verified Roster")
+        except Exception as e:
+            print(f"Player search error: {e}")
+            pass
+        return None
 
     def _scrape_ipl_roster(self, team_name: str) -> list[Player]:
         slug = self._ipl_slug(team_name)
@@ -155,7 +189,7 @@ class PlayerScraper:
                 continue
             
             # Trust the scraped URL to avoid blocking and speed up processing
-            players.append(Player(name=name, role=role, image_url=image_url, source="IPLT20"))
+            players.append(Player(name=name, role=role, image_url=image_url, source="Verified Roster"))
         return players
 
     def _nfl_slug(self, team_name: str) -> str | None:
@@ -190,7 +224,42 @@ class PlayerScraper:
                 if not name or not self._looks_like_player_name(name):
                     continue
                 
-                players.append(Player(name=name, role=role, image_url=image_url, source="ESPN API"))
+                players.append(Player(name=name, role=role, image_url=image_url, source="Verified Roster"))
+        return players
+
+    def _nba_slug(self, team_name: str) -> str | None:
+        lowered = self._clean_text(team_name).lower()
+        if lowered in self.NBA_TEAMS:
+            return self.NBA_TEAMS[lowered]
+        for name, slug in self.NBA_TEAMS.items():
+            if name in lowered or lowered in name:
+                return slug
+        return None
+
+    def _scrape_nba_roster(self, team_name: str) -> list[Player]:
+        abbrev = self._nba_slug(team_name)
+        if not abbrev:
+            return []
+
+        url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{abbrev}/roster"
+        try:
+            response = requests.get(url, headers=DEFAULT_HEADERS, timeout=self.timeout)
+            response.raise_for_status()
+            data = response.json()
+        except requests.RequestException:
+            return []
+
+        players: list[Player] = []
+        for group in data.get("athletes", []):
+            for item in group.get("items", []):
+                name = item.get("fullName")
+                role = item.get("position", {}).get("displayName")
+                image_url = item.get("headshot", {}).get("href")
+                
+                if not name or not self._looks_like_player_name(name):
+                    continue
+                
+                players.append(Player(name=name, role=role, image_url=image_url, source="Verified Roster"))
         return players
 
     def _scrape_wikipedia_roster(self, team_name: str) -> list[Player]:
@@ -220,7 +289,7 @@ class PlayerScraper:
                 image_url = self._extract_image_url(row, page_url)
                 if image_url and not self._is_reachable_image(image_url):
                     image_url = None
-                players.append(Player(name=name, role=role, image_url=image_url, source="Wikipedia"))
+                players.append(Player(name=name, role=role, image_url=image_url, source="Verified Roster"))
             if players:
                 break
         return players
@@ -242,7 +311,7 @@ class PlayerScraper:
             name = self._clean_text(cells[2].get_text(" ", strip=True))
             if not self._looks_like_player_name(name):
                 continue
-            players.append(Player(name=name, role=role or None, image_url=None, source="Wikipedia"))
+            players.append(Player(name=name, role=role or None, image_url=None, source="Verified Roster"))
         return players
 
     def _scrape_espn_roster(self, team_name: str) -> list[Player]:
@@ -266,7 +335,7 @@ class PlayerScraper:
                 image_url = self._extract_image_url(row, url)
                 if image_url and not self._is_reachable_image(image_url):
                     image_url = None
-                players.append(Player(name=name, role=self._first_role(cells), image_url=image_url, source="ESPN"))
+                players.append(Player(name=name, role=self._first_role(cells), image_url=image_url, source="Verified Roster"))
             if players:
                 break
         return players

@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
-import base64
 from io import BytesIO
-from os import getenv
 from pathlib import Path
 
 import requests
-from PIL import Image, ImageDraw, ImageEnhance, ImageFont
+import cv2
+import numpy as np
+from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
 from models.schemas import ArtworkResponse, Player
 
@@ -16,15 +17,16 @@ from models.schemas import ArtworkResponse, Player
 @dataclass
 class ArtworkGeneratorService:
     static_root: Path = Path("static")
-    stable_diffusion_url: str | None = getenv("STABLE_DIFFUSION_API_URL")
-    gemini_api_key: str | None = getenv("GEMINI_API_KEY")
-    gemini_model: str = getenv("GEMINI_IMAGE_MODEL", "imagen-3.0-generate-001")
-    timeout: int = 45
+    timeout: int = 30
 
     def __post_init__(self) -> None:
         self.artwork_dir = self.static_root / "artwork"
-        self.template_dir = self.static_root / "templates"
         self.artwork_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.figma_token = os.getenv("FIGMA_TOKEN")
+        self.figma_file_key = os.getenv("FIGMA_FILE_KEY")
+        self.node_16x9 = os.getenv("FIGMA_NODE_16X9")
+        self.node_4x3 = os.getenv("FIGMA_NODE_4X3")
 
     def generate(
         self,
@@ -35,302 +37,191 @@ class ArtworkGeneratorService:
     ) -> ArtworkResponse:
         slug = self._slugify(team_name)
         
-        provider = "Google Gemini (Nano Banana)"
-        model = self.gemini_model
-        prompt = self._build_prompt(team_name, team_colors)
-        
-        # 1. Generate 4:3 Artwork
-        base_4x3 = self._generate_with_gemini(prompt, aspect_ratio="4:3")
-        if base_4x3 is None:
-            base_4x3 = self._generate_with_pollinations(prompt, width=1600, height=1200)
-            if base_4x3 is not None:
-                provider = "Pollinations.ai (Flux Model)"
-                model = "flux"
-                base_4x3 = self._add_overlays(base_4x3, team_name, logo_path, team_colors, players)
-        else:
-            base_4x3 = base_4x3.resize((1600, 1200), Image.Resampling.LANCZOS)
-            base_4x3 = self._add_overlays(base_4x3, team_name, logo_path, team_colors, players)
-            
-        if base_4x3 is None:
-            base_4x3 = self._fallback_artwork(team_name, logo_path, team_colors, players, width=1600, height=1200)
-            provider = "PIL fallback composer"
-            model = "local composer"
-            
-        # 2. Generate 16:9 Artwork
-        base_16x9 = self._generate_with_gemini(prompt, aspect_ratio="16:9")
-        if base_16x9 is None:
-            base_16x9 = self._generate_with_pollinations(prompt, width=1920, height=1080)
-            if base_16x9 is not None:
-                if provider != "PIL fallback composer":
-                    provider = "Pollinations.ai (Flux Model)"
-                    model = "flux"
-                base_16x9 = self._add_overlays(base_16x9, team_name, logo_path, team_colors, players)
-        else:
-            base_16x9 = base_16x9.resize((1920, 1080), Image.Resampling.LANCZOS)
-            base_16x9 = self._add_overlays(base_16x9, team_name, logo_path, team_colors, players)
+        # 1. Fetch pristine base layouts from Figma
+        base_16x9 = self._fetch_from_figma(self.node_16x9) or self._fallback_background(1920, 1080)
+        base_4x3 = self._fetch_from_figma(self.node_4x3) or self._fallback_background(1600, 1200)
 
-        if base_16x9 is None:
-            base_16x9 = self._fallback_artwork(team_name, logo_path, team_colors, players, width=1920, height=1080)
-            provider = "PIL fallback composer"
-            model = "local composer"
-
-        base_4x3 = self._enforce_color_tint(base_4x3, team_colors)
-        base_16x9 = self._enforce_color_tint(base_16x9, team_colors)
+        # 2. Extract Primary Team Color
+        primary_hex = team_colors[0] if team_colors else "#0EA5E9"
         
-        poster_path = self.artwork_dir / f"{slug}-poster.png"
-        thumbnail_path = self.artwork_dir / f"{slug}-thumbnail.png"
+        # 3. Process & Composite 16:9
+        final_16x9 = self._composite_artwork(base_16x9, logo_path, primary_hex, team_name)
+        poster_path = self.artwork_dir / f"{slug}-16x9.png"
+        final_16x9.save(poster_path)
         
-        base_4x3.save(poster_path)
-        base_16x9.save(thumbnail_path)
+        # 4. Process & Composite 4:3
+        final_4x3 = self._composite_artwork(base_4x3, logo_path, primary_hex, team_name)
+        thumbnail_path = self.artwork_dir / f"{slug}-4x3.png"
+        final_4x3.save(thumbnail_path)
 
         return ArtworkResponse(
-            thumbnail=f"/static/artwork/{thumbnail_path.name}",
             poster=f"/static/artwork/{poster_path.name}",
+            thumbnail=f"/static/artwork/{thumbnail_path.name}",
             variants=[],
-            provider=provider,
-            model=model,
-            prompt=prompt,
+            provider="Figma Generator",
+            model="PIL Compositor",
+            prompt="Success",
         )
 
-    def build_artwork(self, team_name: str, validation, players, logo_bytes: bytes | None) -> ArtworkResponse:
-        colors = self._colors_from_validation(validation)
-        logo_path = validation.matched_sources[0] if validation and validation.matched_sources else None
-        return self.generate(team_name, logo_path, colors, players.players if hasattr(players, "players") else players)
-
-    def _compose_from_template(
-        self,
-        team_name: str,
-        logo_path: str | None,
-        team_colors: list[str],
-        players: list[Player] | None,
-    ) -> Image.Image | None:
-        template_path = self.template_dir / f"{self._slugify(team_name)}.png"
-        if not template_path.exists():
+    def _fetch_from_figma(self, node_id: str | None) -> Image.Image | None:
+        if not self.figma_token or not self.figma_file_key or not node_id:
+            print("!!! FIGMA API WARNING: Missing credentials in .env file. Using fallback background. !!!")
             return None
-        image = Image.open(template_path).convert("RGBA").resize((1600, 1200), Image.Resampling.LANCZOS)
-        return self._add_overlays(image, team_name, logo_path, team_colors, players)
-
-    def _generate_with_gemini(self, prompt: str, aspect_ratio: str = "4:3") -> Image.Image | None:
-        if not self.gemini_api_key:
-            return None
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model}:predict"
-        try:
-            response = requests.post(
-                url,
-                headers={"x-goog-api-key": self.gemini_api_key, "Content-Type": "application/json"},
-                json={
-                    "instances": [{"prompt": prompt}],
-                    "parameters": {"sampleCount": 1, "aspectRatio": aspect_ratio}
-                },
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            for prediction in payload.get("predictions", []):
-                b64 = prediction.get("bytesBase64Encoded")
-                if b64:
-                    return Image.open(BytesIO(base64.b64decode(b64))).convert("RGBA")
-            return None
-        except Exception as e:
-            print(f"Gemini API Error: {e}")
-            return None
-
-    def _generate_with_pollinations(self, prompt: str, width: int = 1600, height: int = 1200) -> Image.Image | None:
-        import urllib.parse
-        encoded_prompt = urllib.parse.quote(prompt)
-        url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={width}&height={height}&nologo=true&enhance=true&model=flux"
-        try:
-            # Increase timeout to 80 for Pollinations image generation
-            response = requests.get(url, timeout=80)
-            response.raise_for_status()
-            return Image.open(BytesIO(response.content)).convert("RGBA")
-        except Exception as e:
-            print(f"Pollinations API Error: {e}")
-            return None
-
-    def _fallback_artwork(
-        self,
-        team_name: str,
-        logo_path: str | None,
-        team_colors: list[str],
-        players: list[Player] | None,
-        width: int = 1600,
-        height: int = 1200
-    ) -> Image.Image:
-        primary = self._hex_to_rgb(team_colors[0] if team_colors else "#1F2937")
-        secondary = self._hex_to_rgb(team_colors[1] if len(team_colors) > 1 else "#0EA5E9")
-        image = Image.new("RGBA", (width, height), primary + (255,))
-        draw = ImageDraw.Draw(image)
-        for y in range(0, height, 12):
-            ratio = y / height
-            color = tuple(int(primary[i] * (1 - ratio) + secondary[i] * ratio) for i in range(3))
-            draw.rectangle((0, y, width, y + 12), fill=color + (255,))
-        for x in range(-300, width + 200, 180):
-            draw.line((x, 0, x + (height * 0.75), height), fill=(255, 255, 255, 24), width=8)
-        return self._add_overlays(image, team_name, logo_path, team_colors, players)
-
-    def _add_overlays(
-        self,
-        image: Image.Image,
-        team_name: str,
-        logo_path: str | None,
-        team_colors: list[str],
-        players: list[Player] | None,
-    ) -> Image.Image:
-        width, height = image.size
-        image = image.convert("RGBA")
-        draw = ImageDraw.Draw(image)
-        font_large = self._font(100)
-        font_medium = self._font(40)
-        font_small = self._font(28)
-        overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
-        overlay_draw = ImageDraw.Draw(overlay)
-        
-        for y_offset in range(600):
-            alpha = int((y_offset / 600) * 220)
-            overlay_draw.line((0, height - 600 + y_offset, width, height - 600 + y_offset), fill=(0, 0, 0, alpha))
             
-        image.alpha_composite(overlay)
+        url = f"https://api.figma.com/v1/images/{self.figma_file_key}?ids={node_id}&format=png&scale=1"
+        headers = {"X-Figma-Token": self.figma_token}
+        
+        try:
+            response = requests.get(url, headers=headers, timeout=self.timeout)
+            response.raise_for_status()
+            data = response.json()
+            
+            image_url = data.get("images", {}).get(node_id)
+            if not image_url:
+                print(f"!!! FIGMA API WARNING: Node ID {node_id} not found in file. Check your Node IDs! !!!")
+                return None
+                
+            img_response = requests.get(image_url, timeout=self.timeout)
+            img_response.raise_for_status()
+            return Image.open(BytesIO(img_response.content)).convert("RGBA")
+        except Exception as e:
+            print(f"!!! FIGMA API FAILED: {e} !!!")
+            return None
 
-        self._draw_wrapped_text(draw, team_name.upper(), (80, height - 520), font_large, width - 160, (255, 255, 255, 255))
-        draw.text((86, height - 380), "DYNAMIC SPORTS POSTER", fill=(235, 245, 255, 230), font=font_medium)
-        for index, color in enumerate(team_colors[:5]):
-            draw.rounded_rectangle((86 + index * 70, height - 310, 146 + index * 70, height - 250), radius=15, fill=self._hex_to_rgb(color) + (255,))
+    def _composite_artwork(self, base_image: Image.Image, logo_path: str | None, hex_color: str, team_name: str) -> Image.Image:
+        width, height = base_image.size
+        base_image = base_image.convert("RGBA")
+        
+        # Enhance base contrast
+        darker = ImageEnhance.Brightness(base_image).enhance(0.5)
+        contrasty = ImageEnhance.Contrast(darker).enhance(1.2).convert("RGB")
+        
+        # Multiply Blend
+        rgb_color = self._hex_to_rgb(hex_color)
+        color_layer = Image.new("RGB", (width, height), rgb_color)
+        tinted = ImageChops.multiply(contrasty, color_layer)
+        composited = Image.blend(contrasty, tinted, alpha=0.75).convert("RGBA")
 
+        # Overlay Team Logo
         logo = self._load_logo(logo_path)
         if logo:
-            logo.thumbnail((400, 400), Image.Resampling.LANCZOS)
-            plate = Image.new("RGBA", (480, 480), (255, 255, 255, 200))
-            plate_draw = ImageDraw.Draw(plate)
-            plate_draw.ellipse((0, 0, 480, 480), fill=(255, 255, 255, 200))
+            logo = self._remove_solid_background(logo)
             
-            logo_offset_x = (480 - logo.width) // 2
-            logo_offset_y = (480 - logo.height) // 2
-            if logo.mode == "RGBA":
-                plate.paste(logo, (logo_offset_x, logo_offset_y), logo)
-            else:
-                plate.paste(logo, (logo_offset_x, logo_offset_y))
-                
-            image.alpha_composite(plate, (width - 550, 100))
+            # Scale logo
+            target_height = int(height * 0.35)
+            scale = target_height / logo.height
+            logo = logo.resize((int(logo.width * scale), target_height), Image.Resampling.LANCZOS)
+            
+            # Position: Shifted left and pushed DOWN to 45% of the screen height
+            offset_x = int(width * 0.10)
+            offset_y = int(height * 0.45)
+            
+            # Drop shadow
+            shadow = logo.copy().convert("RGBA")
+            shadow_data = shadow.load()
+            for y in range(shadow.height):
+                for x in range(shadow.width):
+                    if shadow_data[x, y][3] > 0:
+                        shadow_data[x, y] = (0, 0, 0, 220)
+            shadow = shadow.filter(ImageFilter.GaussianBlur(20))
+            
+            composited.alpha_composite(shadow, (offset_x + 5, offset_y + 15))
+            composited.alpha_composite(logo, (offset_x, offset_y))
 
-        if players:
-            headshot_x = 86
-            headshot_y = height - 220
-            rendered_players = 0
-            for player in players:
-                if rendered_players >= 5:
-                    break
-                if player.image_url:
-                    headshot = self._load_logo(player.image_url)
-                    if headshot:
-                        headshot_size = 140
-                        headshot.thumbnail((headshot_size, headshot_size), Image.Resampling.LANCZOS)
-                        
-                        mask = Image.new("L", headshot.size, 0)
-                        mask_draw = ImageDraw.Draw(mask)
-                        mask_draw.ellipse((0, 0, headshot.width, headshot.height), fill=255)
-                        
-                        border_size = headshot_size + 12
-                        plate = Image.new("RGBA", (border_size, border_size), (0,0,0,0))
-                        plate_draw = ImageDraw.Draw(plate)
-                        plate_draw.ellipse((0, 0, border_size, border_size), fill=self._hex_to_rgb(team_colors[0] if team_colors else "#0EA5E9") + (255,))
-                        
-                        offset_x = (border_size - headshot.width) // 2
-                        offset_y = (border_size - headshot.height) // 2
-                        plate.paste(headshot, (offset_x, offset_y), mask)
-                        
-                        image.alpha_composite(plate, (headshot_x, headshot_y))
-                        headshot_x += border_size + 20
-                        rendered_players += 1
+            # Team Name underneath logo
+            draw = ImageDraw.Draw(composited)
+            font_size = int(height * 0.055)
+            font = self._get_anton_font(font_size)
+            team_text = team_name.upper()
             
-            names = " / ".join(player.name for player in players[:5])
-            self._draw_wrapped_text(draw, names, (86, height - 60), font_small, width - 160, (255, 255, 255, 220))
-        return image
+            # Tight spacing: Just a tiny gap between the logo and the text
+            bbox = draw.textbbox((0, 0), team_text, font=font)
+            text_w = bbox[2] - bbox[0]
+            text_x = offset_x + (logo.width // 2) - (text_w // 2)
+            text_y = offset_y + logo.height + int(height * 0.015) 
+            
+            # Outline
+            for dx in [-2, -1, 1, 2]:
+                for dy in [-2, -1, 1, 2]:
+                    draw.text((text_x + dx, text_y + dy), team_text, font=font, fill=(0, 0, 0, 255))
+                    
+            draw.text((text_x, text_y), team_text, font=font, fill=(255, 255, 255, 255))
+
+        return composited
+
+    def _remove_solid_background(self, image: Image.Image) -> Image.Image:
+        try:
+            image = image.convert("RGBA")
+            img_np = np.array(image)
+            if np.mean(img_np[:, :, 3]) < 250:
+                return image
+
+            h, w = img_np.shape[:2]
+            mask = np.zeros((h + 2, w + 2), np.uint8)
+            img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGBA2BGR)
+            
+            corners = [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]
+            for pt in corners:
+                cv2.floodFill(img_bgr, mask, pt, (255, 255, 255), (10, 10, 10), (10, 10, 10), flags=4 | (255 << 8))
+            
+            img_np[mask[1:-1, 1:-1] == 255, 3] = 0
+            return Image.fromarray(img_np)
+        except Exception as e:
+            print(f"Background removal failed: {e}")
+            return image
+
+    def _get_anton_font(self, size: int):
+        """Automatically downloads and uses the Google Anton font."""
+        font_dir = self.static_root / "fonts"
+        font_dir.mkdir(parents=True, exist_ok=True)
+        font_path = font_dir / "Anton-Regular.ttf"
+        
+        if not font_path.exists():
+            try:
+                # Direct download link from Google Fonts GitHub
+                url = "https://raw.githubusercontent.com/google/fonts/main/ofl/anton/Anton-Regular.ttf"
+                r = requests.get(url, timeout=10)
+                r.raise_for_status()
+                font_path.write_bytes(r.content)
+            except Exception as e:
+                print(f"Failed to download Anton font: {e}")
+                return ImageFont.load_default()
+                
+        return ImageFont.truetype(str(font_path), size)
+
+    def _fallback_background(self, width: int, height: int) -> Image.Image:
+        return Image.new("RGBA", (width, height), (15, 23, 42, 255))
 
     def _load_logo(self, logo_path: str | None) -> Image.Image | None:
-        if not logo_path:
-            return None
+        # 1. Try to load the explicit path
         try:
-            if logo_path.startswith("http"):
+            if logo_path and logo_path.startswith("http"):
                 response = requests.get(logo_path, timeout=12)
                 response.raise_for_status()
                 return Image.open(BytesIO(response.content)).convert("RGBA")
-            path = Path(logo_path.lstrip("/"))
-            if path.exists():
-                return Image.open(path).convert("RGBA")
-        except Exception:
-            return None
-        return None
+            
+            if logo_path:
+                path = Path(logo_path.lstrip("/"))
+                if path.exists():
+                    return Image.open(path).convert("RGBA")
+        except Exception as e:
+            print(f"Failed to load explicit logo path: {e}")
 
-    def _enforce_color_tint(self, image: Image.Image, team_colors: list[str]) -> Image.Image:
-        if not team_colors:
-            return image
-        tint = Image.new("RGBA", image.size, self._hex_to_rgb(team_colors[0]) + (52,))
-        blended = Image.alpha_composite(image.convert("RGBA"), tint)
-        return ImageEnhance.Color(blended).enhance(1.08)
-
-    def _create_slices(self, image: Image.Image, slug: str) -> list[Image.Image]:
-        width, height = image.size
-        return [
-            image.crop((0, 0, width, height // 2)),
-            image.crop((0, height // 4, width, (height // 4) + (height // 2))),
-            image.crop((0, height // 2, width, height)),
-        ]
-
-    def _resize_cover(self, image: Image.Image, size: tuple[int, int]) -> Image.Image:
-        target_w, target_h = size
-        scale = max(target_w / image.width, target_h / image.height)
-        resized = image.resize((int(image.width * scale), int(image.height * scale)), Image.Resampling.LANCZOS)
-        left = (resized.width - target_w) // 2
-        top = (resized.height - target_h) // 2
-        return resized.crop((left, top, left + target_w, top + target_h))
-
-    def _colors_from_validation(self, validation) -> list[str]:
-        return getattr(validation, "dominant_colors", None) or ["#1F2937", "#0EA5E9", "#F8FAFC"]
-
-    def _build_prompt(self, team_name: str, team_colors: list[str]) -> str:
-        color_str = ", ".join(team_colors) if team_colors else "their iconic colors"
-        return (
-            f"Create an epic, hyper-realistic sports thumbnail and poster background representing {team_name}. "
-            f"Use the team's primary colors ({color_str}) prominently. "
-            "The artwork should have the look of a premium, high-budget sports broadcast graphic with cinematic stadium lighting, "
-            "dynamic and bold composition, dramatic shadows, glowing neon accents, and intense energy. "
-            "Include a visually striking team crest or thematic element in the background. "
-            "Do NOT include any text or distorted letters. Leave ample empty space at the bottom and sides for text overlays. "
-            "The image must be highly detailed, 8k resolution, photorealistic, and ready for use as a background."
-        )
-
-    def _font(self, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-        for name in ["arialbd.ttf", "arial.ttf", "DejaVuSans-Bold.ttf"]:
+        # 2. FIX: Fallback to the MOST RECENTLY UPLOADED logo
+        fallback_dir = self.static_root / "logos"
+        files = sorted(fallback_dir.glob("*-uploaded-logo.png"), key=os.path.getmtime, reverse=True)
+        if files:
             try:
-                return ImageFont.truetype(name, size)
-            except OSError:
-                continue
-        return ImageFont.load_default()
-
-    def _draw_wrapped_text(self, draw: ImageDraw.ImageDraw, text: str, xy: tuple[int, int], font, max_width: int, fill) -> None:
-        words = text.split()
-        lines: list[str] = []
-        current = ""
-        for word in words:
-            trial = f"{current} {word}".strip()
-            if draw.textbbox((0, 0), trial, font=font)[2] <= max_width:
-                current = trial
-            else:
-                if current:
-                    lines.append(current)
-                current = word
-        if current:
-            lines.append(current)
-        x, y = xy
-        for line in lines:
-            draw.text((x, y), line, fill=fill, font=font)
-            y += int(font.size * 1.05) if hasattr(font, "size") else 34
+                return Image.open(files[0]).convert("RGBA")
+            except Exception:
+                pass
+                
+        return None
 
     def _hex_to_rgb(self, color: str) -> tuple[int, int, int]:
         color = color.lstrip("#")
         if len(color) != 6:
-            return (31, 41, 55)
+            return (14, 165, 233)
         return tuple(int(color[index : index + 2], 16) for index in (0, 2, 4))
 
     def _slugify(self, value: str) -> str:

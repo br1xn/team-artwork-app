@@ -19,3 +19,19 @@ def get_players(team_name: str = Query(..., min_length=2)) -> PlayerCollectionRe
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Player scraping failed: {exc}",
         ) from exc
+
+
+@router.get("/players/search")
+def search_player(name: str = Query(..., min_length=2)):
+    try:
+        player = scraper.search_player_by_name(name)
+        if not player:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Player not found")
+        return {"player": player}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Player search failed: {exc}",
+        ) from exc

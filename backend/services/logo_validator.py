@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 import re
 from dataclasses import dataclass
-from urllib.parse import quote_plus, urljoin
+from urllib.parse import quote_plus, urljoin, urlparse
 
 import cv2
 import numpy as np
@@ -13,11 +13,21 @@ from PIL import Image, UnidentifiedImageError
 
 from models.schemas import LogoSource, LogoValidationRequest, LogoValidationResponse
 
-
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
 }
 
+TRUSTED_DOMAINS = [
+    "nfl.com",
+    "espn.com",
+    "sports.yahoo.com",
+    "cbssports.com",
+    "wikipedia.org",
+    "wikimedia.org",
+    "iplt20.com",
+    "espncricinfo.com",
+    "cricbuzz.com"
+]
 
 @dataclass
 class LogoValidator:
@@ -49,6 +59,7 @@ class LogoValidator:
         team = team_name.strip()
         if not team:
             raise ValueError("Team name is required.")
+        
         if not logo_bytes:
             return LogoValidationResponse(
                 team=team,
@@ -78,18 +89,17 @@ class LogoValidator:
                 sources_checked=[],
                 candidate_sources=[],
                 uploaded_filename=filename,
-                error="No candidate logos found.",
-                validation_evidence="No online sources could be found to validate the logo against.",
+                error="No trusted candidate logos found.",
+                validation_evidence=f"No online sources from trusted domains ({', '.join(TRUSTED_DOMAINS[:3])}...) could be found to validate the logo against.",
                 dominant_colors=[],
             )
 
         input_palette = self.extract_dominant_colors(input_image)
         input_embedding = self._embed_image(input_image)
 
-        best_visual = 0.0
-        best_color = 0.0
-        matched_sources: list[str] = []
+        scored_candidates = []
 
+        # Evaluate and score EVERY candidate source
         for source in candidate_sources:
             candidate_bytes = self._download_image(source.url)
             if not candidate_bytes:
@@ -101,27 +111,60 @@ class LogoValidator:
 
             visual = self._visual_similarity(input_embedding, candidate_image)
             color = self._color_similarity(input_palette, self.extract_dominant_colors(candidate_image))
-            if visual > best_visual:
-                best_visual = visual
-            if color > best_color:
-                best_color = color
-            if visual >= 0.45 or color >= 0.6:
-                matched_sources.append(source.url)
+            
+            combined_score = (0.7 * visual) + (0.3 * color)
+            
+            scored_candidates.append({
+                "url": source.url,
+                "visual": visual,
+                "color": color,
+                "score": combined_score,
+                "provider": source.provider
+            })
 
-        confidence = round((0.7 * best_visual) + (0.3 * best_color), 4)
+        # Sort all candidates by their combined score, highest first
+        scored_candidates.sort(key=lambda x: x["score"], reverse=True)
+
+        if not scored_candidates:
+            return LogoValidationResponse(
+                team=team,
+                confidence=0.05,
+                status="invalid",
+                matched_sources=[],
+                color_match=0.0,
+                visual_match=0.0,
+                sources_checked=[s.url for s in candidate_sources],
+                candidate_sources=candidate_sources,
+                uploaded_filename=filename,
+                error="Failed to process candidate images.",
+                validation_evidence="Trusted sources were found, but the image processing pipeline failed to parse them.",
+                dominant_colors=self._palette_to_hex(input_palette),
+            )
+
+        # Slice the Top 3 strongest matches
+        top_sources = scored_candidates[:3]
+        best_match = top_sources[0]
+        
+        confidence = round(best_match["score"], 4)
+        is_valid = confidence >= self.valid_threshold
+        
+        # Keep up to 3 sources for the frontend display
+        matched_sources = [m["url"] for m in top_sources]
+
         evidence = (
-            f"The logo was validated using the {self.model_name} model via {self.validation_provider}. "
-            f"It achieved a confidence score of {confidence * 100:.2f}% based on {len(matched_sources)} matched sources "
-            f"from verified platforms (Wikipedia, Official Sites). "
-            f"Visual similarity contributed {(best_visual * 0.7 * 100):.1f}% and Color similarity contributed {(best_color * 0.3 * 100):.1f}%."
+            f"Validated using {self.model_name} via {self.validation_provider}. "
+            f"Achieved a primary confidence score of {confidence * 100:.2f}%. "
+            f"Cross-referenced and ranked against {len(matched_sources)} highly correlated trusted sources (Top Match: {best_match['provider']}). "
+            f"Top visual similarity contributed {(best_match['visual'] * 0.7 * 100):.1f}% and color contributed {(best_match['color'] * 0.3 * 100):.1f}%."
         )
+        
         return LogoValidationResponse(
             team=team,
             confidence=confidence,
-            status="valid" if confidence >= self.valid_threshold else "invalid",
+            status="valid" if is_valid else "invalid",
             matched_sources=matched_sources,
-            color_match=round(best_color, 4),
-            visual_match=round(best_visual, 4),
+            color_match=round(best_match["color"], 4),
+            visual_match=round(best_match["visual"], 4),
             sources_checked=[source.url for source in candidate_sources],
             candidate_sources=candidate_sources,
             uploaded_filename=filename,
@@ -132,61 +175,79 @@ class LogoValidator:
     def fetch_candidate_logos(self, team_name: str) -> list[LogoSource]:
         sources = []
         sources.extend(self._fetch_wikipedia_logos(team_name))
-        sources.extend(self._fetch_official_site_logos(team_name))
         sources.extend(self._fetch_google_image_logos(team_name))
         return self._dedupe_sources(sources)
+
+    def _is_valid_logo_url(self, url: str) -> bool:
+        if not url: return False
+        
+        # 1. Enforce Trusted Domains
+        domain = urlparse(url).netloc.lower()
+        is_trusted = any(trusted in domain for trusted in TRUSTED_DOMAINS)
+        
+        # CDN exceptions for sports sites
+        cdn_exceptions = ["espncdn.com", "turner.com", "wikimedia.org", "wimg.co.uk"]
+        is_trusted = is_trusted or any(cdn in domain for cdn in cdn_exceptions)
+
+        if not is_trusted:
+            return False
+
+        lower_url = url.lower()
+        
+        # 2. Filter out non-logo items AND Wikipedia UI icons
+        invalid_keywords = [
+            'kit', 'body', 'shorts', 'uniform', 'cap', 'jersey', 'shoe', 'socks', 'stadium', 'fans',
+            'current_event', 'portal', 'icon', 'stub', 'edit_ambox', 'question_mark'
+        ]
+        if any(kw in lower_url for kw in invalid_keywords):
+            return False
+            
+        # 3. Filter out tiny Wikipedia thumbnails (e.g., /40px-)
+        if re.search(r'/[1-9][0-9]?px-', lower_url):
+            return False
+
+        return True
 
     def _fetch_wikipedia_logos(self, team_name: str) -> list[LogoSource]:
         page_url = f"https://en.wikipedia.org/wiki/{quote_plus(team_name.replace(' ', '_'))}"
         soup = self._get_soup(page_url)
         if not soup:
             return []
-        images = soup.select(".infobox img")[:5]
-        return [
-            LogoSource(provider="Wikipedia", url=self._absolute_url(src.get("src"), "https://en.wikipedia.org"), label=src.get("alt") or team_name)
-            for src in images
-            if src.get("src")
-        ]
-
-    def _fetch_official_site_logos(self, team_name: str) -> list[LogoSource]:
-        page_url = f"https://en.wikipedia.org/wiki/{quote_plus(team_name.replace(' ', '_'))}"
-        soup = self._get_soup(page_url)
-        if not soup:
-            return []
-        official = None
-        for link in soup.select("a.external"):
-            text = link.get_text(" ", strip=True).lower()
-            href = link.get("href")
-            if href and ("official" in text or "website" in text):
-                official = href
-                break
-        if not official:
-            return []
-
-        site = self._get_soup(official)
-        if not site:
-            return []
-        urls = []
-        for image in site.select("img")[:20]:
-            src = image.get("src") or image.get("data-src")
-            alt = (image.get("alt") or "").lower()
-            if src and ("logo" in alt or "crest" in alt or "team" in alt):
-                urls.append(LogoSource(provider="Official Website", url=urljoin(official, src), label=image.get("alt") or f"{team_name} logo"))
-        return urls[:5]
+        
+        sources = []
+        for img in soup.select(".infobox img"):
+            src = img.get("src")
+            abs_url = self._absolute_url(src, "https://en.wikipedia.org")
+            if src and self._is_valid_logo_url(abs_url):
+                alt_text = img.get("alt") or team_name
+                if "logo" in alt_text.lower() or "crest" in alt_text.lower() or "logo" in src.lower():
+                    sources.insert(0, LogoSource(provider="Wikipedia", url=abs_url, label=alt_text))
+                else:
+                    sources.append(LogoSource(provider="Wikipedia", url=abs_url, label=alt_text))
+                if len(sources) >= 5:
+                    break
+        return sources
 
     def _fetch_google_image_logos(self, team_name: str) -> list[LogoSource]:
-        query = quote_plus(f"{team_name} logo")
+        # Force Google to only pull from our trusted domains
+        site_query = " OR ".join([f"site:{domain}" for domain in TRUSTED_DOMAINS[:6]])
+        query = quote_plus(f"{team_name} logo ({site_query})")
         url = f"https://www.google.com/search?tbm=isch&q={query}"
+        
         try:
             response = requests.get(url, headers=HEADERS, timeout=self.timeout)
             response.raise_for_status()
         except requests.RequestException:
             return []
+            
         matches = re.findall(r'"(https?://[^"]+\.(?:png|jpg|jpeg|webp))"', response.text)
-        return [
-            LogoSource(provider="Google Images", url=match.replace("\\u003d", "="), label=f"{team_name} logo")
-            for match in matches[:5]
-        ]
+        sources = []
+        for match in matches:
+            clean_url = match.replace("\\u003d", "=")
+            if self._is_valid_logo_url(clean_url):
+                sources.append(LogoSource(provider="Google Images (Trusted)", url=clean_url, label=f"{team_name} logo"))
+                
+        return sources[:8]
 
     def extract_dominant_colors(self, image: Image.Image, color_count: int = 5) -> list[tuple[int, int, int]]:
         prepared = self._preprocess_image(image).convert("RGB")
@@ -243,7 +304,8 @@ class LogoValidator:
             self.processor = CLIPProcessor.from_pretrained(self.model_name)
             self.model = CLIPModel.from_pretrained(self.model_name)
             self.model.eval()
-        except Exception:
+        except Exception as e:
+            print(f"Failed to load CLIP model: {e}")
             self.torch = None
             self.processor = None
             self.model = None

@@ -33,7 +33,9 @@ export function UploadLogo({ logoFile, onChange }) {
           onChange={(event) => onChange(event.target.files?.[0] || null)}
         />
       </label>
-      <p className="microcopy">Small or low-resolution logos are upscaled before validation.</p>
+      <p className="microcopy">
+        Small logos are upscaled. Validated strictly against official sources (ESPN, NFL, Wikipedia).
+      </p>
     </div>
   );
 }
