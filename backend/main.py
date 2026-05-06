@@ -47,8 +47,14 @@ app.include_router(validate_router, prefix="/api")
 app.include_router(players_router, prefix="/api")
 app.include_router(artwork_router, prefix="/api")
 
+# Ensure all static subdirectories exist so the Figma Generator doesn't crash
 static_root = Path("static")
 static_root.mkdir(exist_ok=True)
+(static_root / "artwork").mkdir(exist_ok=True)
+(static_root / "logos").mkdir(exist_ok=True)
+(static_root / "fonts").mkdir(exist_ok=True)
+
+# Mount the static directory to serve generated images to the React frontend
 app.mount("/static", StaticFiles(directory=static_root), name="static")
 
 validator = LogoValidator(timeout=10)
@@ -140,7 +146,7 @@ async def process_team(
                 logo_path = discovered_sources[0].url
 
         artwork = await asyncio.wait_for(
-            run_in_threadpool(generator.generate, team, logo_path, team_colors, players),
+            run_in_threadpool(generator.generate, team, logo_bytes, team_colors, players), # Passes logo_bytes directly to generator
             timeout=120,
         )
 

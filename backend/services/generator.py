@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -31,26 +32,26 @@ class ArtworkGeneratorService:
     def generate(
         self,
         team_name: str,
-        logo_path: str | None,
+        logo_bytes: bytes | None,
         team_colors: list[str],
         players: list[Player] | None = None,
     ) -> ArtworkResponse:
         slug = self._slugify(team_name)
         
-        # 1. Fetch pristine base layouts from Figma
-        base_16x9 = self._fetch_from_figma(self.node_16x9) or self._fallback_background(1920, 1080)
-        base_4x3 = self._fetch_from_figma(self.node_4x3) or self._fallback_background(1600, 1200)
+        # 1. Fetch pristine base layouts from Figma (NOW WITH CACHING)
+        base_16x9 = self._fetch_from_figma(self.node_16x9, "16x9") or self._fallback_background(1920, 1080)
+        base_4x3 = self._fetch_from_figma(self.node_4x3, "4x3") or self._fallback_background(1600, 1200)
 
         # 2. Extract Primary Team Color
         primary_hex = team_colors[0] if team_colors else "#0EA5E9"
         
         # 3. Process & Composite 16:9
-        final_16x9 = self._composite_artwork(base_16x9, logo_path, primary_hex, team_name)
+        final_16x9 = self._composite_artwork(base_16x9, logo_bytes, primary_hex, team_name)
         poster_path = self.artwork_dir / f"{slug}-16x9.png"
         final_16x9.save(poster_path)
         
         # 4. Process & Composite 4:3
-        final_4x3 = self._composite_artwork(base_4x3, logo_path, primary_hex, team_name)
+        final_4x3 = self._composite_artwork(base_4x3, logo_bytes, primary_hex, team_name)
         thumbnail_path = self.artwork_dir / f"{slug}-4x3.png"
         final_4x3.save(thumbnail_path)
 
@@ -63,34 +64,61 @@ class ArtworkGeneratorService:
             prompt="Success",
         )
 
-    def _fetch_from_figma(self, node_id: str | None) -> Image.Image | None:
+    def _fetch_from_figma(self, node_id: str | None, format_label: str) -> Image.Image | None:
+        """Fetches from Figma with Local Caching and 429 Retry Logic"""
         if not self.figma_token or not self.figma_file_key or not node_id:
             print("!!! FIGMA API WARNING: Missing credentials in .env file. Using fallback background. !!!")
             return None
             
+        # --- CACHE CHECK ---
+        # If we already downloaded this exact Figma background today, just use the local copy!
+        cache_path = self.artwork_dir / f"figma_cache_{format_label}.png"
+        if cache_path.exists():
+            return Image.open(cache_path).convert("RGBA")
+
         url = f"https://api.figma.com/v1/images/{self.figma_file_key}?ids={node_id}&format=png&scale=1"
         headers = {"X-Figma-Token": self.figma_token}
         
-        try:
-            response = requests.get(url, headers=headers, timeout=self.timeout)
-            response.raise_for_status()
-            data = response.json()
-            
-            image_url = data.get("images", {}).get(node_id)
-            if not image_url:
-                print(f"!!! FIGMA API WARNING: Node ID {node_id} not found in file. Check your Node IDs! !!!")
-                return None
+        # --- RETRY LOGIC (For 429 Errors) ---
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(url, headers=headers, timeout=self.timeout)
                 
-            img_response = requests.get(image_url, timeout=self.timeout)
-            img_response.raise_for_status()
-            return Image.open(BytesIO(img_response.content)).convert("RGBA")
-        except Exception as e:
-            print(f"!!! FIGMA API FAILED: {e} !!!")
-            return None
+                if response.status_code == 429:
+                    print(f"Figma API Rate Limited (429). Retrying in {2 ** attempt} seconds...")
+                    time.sleep(2 ** attempt)  # Exponential backoff: waits 1s, then 2s, then 4s
+                    continue
+                    
+                response.raise_for_status()
+                data = response.json()
+                
+                image_url = data.get("images", {}).get(node_id)
+                if not image_url:
+                    print(f"!!! FIGMA API WARNING: Node ID {node_id} not found in file. Check your Node IDs! !!!")
+                    return None
+                    
+                img_response = requests.get(image_url, timeout=self.timeout)
+                img_response.raise_for_status()
+                
+                # Convert to PIL Image
+                img = Image.open(BytesIO(img_response.content)).convert("RGBA")
+                
+                # SAVE TO CACHE so we never hit the API for this layout again!
+                img.save(cache_path)
+                return img
+                
+            except Exception as e:
+                print(f"!!! FIGMA API FAILED (Attempt {attempt + 1}/{max_retries}): {e} !!!")
+                time.sleep(1)
+        
+        return None
 
-    def _composite_artwork(self, base_image: Image.Image, logo_path: str | None, hex_color: str, team_name: str) -> Image.Image:
+    def _composite_artwork(self, base_image: Image.Image, logo_bytes: bytes | None, hex_color: str, team_name: str) -> Image.Image:
         width, height = base_image.size
-        base_image = base_image.convert("RGBA")
+        
+        # Ensure base image is a copy so we don't overwrite our cached version in memory
+        base_image = base_image.copy().convert("RGBA")
         
         # Enhance base contrast
         darker = ImageEnhance.Brightness(base_image).enhance(0.5)
@@ -102,8 +130,9 @@ class ArtworkGeneratorService:
         tinted = ImageChops.multiply(contrasty, color_layer)
         composited = Image.blend(contrasty, tinted, alpha=0.75).convert("RGBA")
 
-        # Overlay Team Logo
-        logo = self._load_logo(logo_path)
+        # Load the logo directly from memory bytes
+        logo = self._load_logo(logo_bytes)
+        
         if logo:
             logo = self._remove_solid_background(logo)
             
@@ -171,14 +200,12 @@ class ArtworkGeneratorService:
             return image
 
     def _get_anton_font(self, size: int):
-        """Automatically downloads and uses the Google Anton font."""
         font_dir = self.static_root / "fonts"
         font_dir.mkdir(parents=True, exist_ok=True)
         font_path = font_dir / "Anton-Regular.ttf"
         
         if not font_path.exists():
             try:
-                # Direct download link from Google Fonts GitHub
                 url = "https://raw.githubusercontent.com/google/fonts/main/ofl/anton/Anton-Regular.ttf"
                 r = requests.get(url, timeout=10)
                 r.raise_for_status()
@@ -192,31 +219,14 @@ class ArtworkGeneratorService:
     def _fallback_background(self, width: int, height: int) -> Image.Image:
         return Image.new("RGBA", (width, height), (15, 23, 42, 255))
 
-    def _load_logo(self, logo_path: str | None) -> Image.Image | None:
-        # 1. Try to load the explicit path
+    def _load_logo(self, logo_bytes: bytes | None) -> Image.Image | None:
+        if not logo_bytes:
+            return None
         try:
-            if logo_path and logo_path.startswith("http"):
-                response = requests.get(logo_path, timeout=12)
-                response.raise_for_status()
-                return Image.open(BytesIO(response.content)).convert("RGBA")
-            
-            if logo_path:
-                path = Path(logo_path.lstrip("/"))
-                if path.exists():
-                    return Image.open(path).convert("RGBA")
+            return Image.open(BytesIO(logo_bytes)).convert("RGBA")
         except Exception as e:
-            print(f"Failed to load explicit logo path: {e}")
-
-        # 2. FIX: Fallback to the MOST RECENTLY UPLOADED logo
-        fallback_dir = self.static_root / "logos"
-        files = sorted(fallback_dir.glob("*-uploaded-logo.png"), key=os.path.getmtime, reverse=True)
-        if files:
-            try:
-                return Image.open(files[0]).convert("RGBA")
-            except Exception:
-                pass
-                
-        return None
+            print(f"Failed to load logo from memory: {e}")
+            return None
 
     def _hex_to_rgb(self, color: str) -> tuple[int, int, int]:
         color = color.lstrip("#")

@@ -168,7 +168,14 @@ export function Home() {
     setArtStatus("loading");
     const formData = new FormData();
     formData.append("team_name", validationData.team);
+
+    // Pass the actual file object, NOT just the string name
     formData.append("logo", logoFile);
+
+    // Explicitly tell the backend which filename we are dealing with
+    if (validationData.uploaded_filename) {
+      formData.append("filename", validationData.uploaded_filename);
+    }
 
     try {
       const res = await fetch(`${API_BASE}/artwork`, { method: "POST", body: formData });
